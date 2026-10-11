@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-SolAlpha Sniper — Telegram bot (Render Background Worker)
+SolAlpha Sniper — Telegram bot (Render Web Service)
 
 الأمر /best يقوم بمسح مباشر لسوق Solana ويطبق خط فلترة صارم:
   1) اكتشاف العملات: DexScreener + GeckoTerminal (+ Birdeye اختياري)
@@ -12,8 +12,6 @@ SolAlpha Sniper — Telegram bot (Render Background Worker)
 متغيرات البيئة:
   TELEGRAM_BOT_TOKEN   (مطلوب)
   BIRDEYE_API_KEY      (اختياري — مصدر إضافي للعملات الرائجة)
-  MIN_SCORE, MIN_LIQUIDITY_USD, MIN_VOLUME_H1_USD, MAX_TOP10_PCT, MAX_DEV_PCT,
-  MIN_LP_LOCKED_PCT, RUGCHECK_MAX_NORM ... (كلها اختيارية، القيم الافتراضية أدناه)
 """
 
 import asyncio
@@ -27,6 +25,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import httpx
+from aiohttp import web
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
@@ -44,27 +43,27 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-MIN_SCORE = _env_float("MIN_SCORE", 80)                      # حد القبول النهائي
+MIN_SCORE = _env_float("MIN_SCORE", 80)
 MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 20_000)
 MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 15_000)
 MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 50_000)
 MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 50_000_000)
 MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 60)
-MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)     # تجنب القمم البارابولية
-MIN_VOL_PACE = _env_float("MIN_VOL_PACE", 1.0)               # فوليوم 5m*12 / فوليوم 1h
-MIN_H1_VS_H6 = _env_float("MIN_H1_VS_H6", 1.3)               # مفاجأة الفوليوم
+MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)
+MIN_VOL_PACE = _env_float("MIN_VOL_PACE", 1.0)
+MIN_H1_VS_H6 = _env_float("MIN_H1_VS_H6", 1.3)
 
 MAX_DEV_PCT = _env_float("MAX_DEV_PCT", 5)
 MAX_TOP10_PCT = _env_float("MAX_TOP10_PCT", 25)
-MIN_LP_LOCKED_PCT = _env_float("MIN_LP_LOCKED_PCT", 95)      # 100% مع هامش تقريب
-RUGCHECK_MAX_NORM = _env_float("RUGCHECK_MAX_NORM", 20)      # score_normalised (0=آمن)
-RUGCHECK_MAX_RAW = _env_float("RUGCHECK_MAX_RAW", 500)       # احتياطي إن غاب score_normalised
+MIN_LP_LOCKED_PCT = _env_float("MIN_LP_LOCKED_PCT", 95)
+RUGCHECK_MAX_NORM = _env_float("RUGCHECK_MAX_NORM", 20)
+RUGCHECK_MAX_RAW = _env_float("RUGCHECK_MAX_RAW", 500)
 
 MIN_CANDLES = 20
-MAX_WINDOW_CANDLES = 72           # آخر 6 ساعات (شموع 5 دقائق)
-SWING_LOOKBACK_CANDLES = 36       # البحث عن قاع الموجة قبل القمة
-MIN_LEG_PCT = _env_float("MIN_LEG_PCT", 12)                  # أقل حجم للموجة الصاعدة
-MAX_ABOVE_ZONE_PCT = _env_float("MAX_ABOVE_ZONE_PCT", 10)    # أقصى ابتعاد فوق المنطقة
+MAX_WINDOW_CANDLES = 72
+SWING_LOOKBACK_CANDLES = 36
+MIN_LEG_PCT = _env_float("MIN_LEG_PCT", 12)
+MAX_ABOVE_ZONE_PCT = _env_float("MAX_ABOVE_ZONE_PCT", 10)
 MAX_SL_RISK_PCT = _env_float("MAX_SL_RISK_PCT", 25)
 SL_BUFFER = 0.015
 TP1_PCT = 0.18
@@ -89,9 +88,9 @@ DEX_TOKEN_LIST_URLS = (
 )
 
 EXCLUDED_MINTS = {
-    "So11111111111111111111111111111111111111112",   # wSOL
-    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",  # USDC
-    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",  # USDT
+    "So11111111111111111111111111111111111111112",
+    "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+    "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
 }
 
 logging.basicConfig(
@@ -105,7 +104,6 @@ log = logging.getLogger("solalpha")
 
 
 def to_float(v: Any, default: float = 0.0) -> float:
-    """تحويل آمن: بعض الـ APIs (GeckoTerminal) تُرجع الأرقام كنصوص."""
     if v is None or isinstance(v, bool):
         return default
     try:
@@ -181,7 +179,7 @@ async def _gecko_tokens(client: httpx.AsyncClient, path: str, params: Optional[d
     items = data.get("data") if isinstance(data, dict) else None
     for item in items or []:
         try:
-            tid = item["relationships"]["base_token"]["data"]["id"]  # "solana_<mint>"
+            tid = item["relationships"]["base_token"]["data"]["id"]
             out.append(tid.split("_", 1)[1])
         except (KeyError, TypeError, IndexError):
             continue
@@ -220,7 +218,6 @@ async def discover_token_addresses(client: httpx.AsyncClient) -> list:
 
 
 async def fetch_pairs(client: httpx.AsyncClient, addresses: list) -> list:
-    """جلب بيانات الأزواج من DexScreener (30 عنواناً لكل طلب) واختيار أعمق زوج لكل عملة."""
     chunks = [addresses[i:i + 30] for i in range(0, len(addresses), 30)]
     responses = await asyncio.gather(
         *(fetch_json(client, f"{DEX}/tokens/v1/solana/{','.join(c)}") for c in chunks)
@@ -286,7 +283,6 @@ def extract_metrics(pair: dict) -> Optional[dict]:
 
 
 def pre_filter(m: dict) -> Optional[str]:
-    """يرجع سبب الرفض أو None إن اجتازت الفلترة الأولية (مفاجأة فوليوم + زخم إيجابي)."""
     if m["dex"] == "pumpfun":
         return "لم تهاجر من Bonding Curve بعد"
     if m["price"] <= 0:
@@ -299,7 +295,6 @@ def pre_filter(m: dict) -> Optional[str]:
         return "عمر الزوج قصير جداً"
     if m["vol1"] < MIN_VOLUME_H1_USD:
         return "حجم تداول 1h ضعيف"
-    # شمعة 5 دقائق إيجابية = تأكيد ارتداد، و1h إيجابي = اتجاه صاعد
     if m["chg5"] <= 0 or m["chg1"] <= 0:
         return "الزخم غير إيجابي (5m/1h)"
     if m["chg1"] > MAX_H1_CHANGE_PCT:
@@ -354,9 +349,8 @@ def analyze_security(report: dict, pair_address: str) -> Security:
         for src in (token, report):
             if key in src:
                 return src[key] in (None, "", "null")
-        return None  # غير معروف → يُعامل كفشل
+        return None
 
-    # 1) Mint / Freeze
     mint_rev = authority_revoked("mintAuthority")
     if mint_rev is not True:
         reasons.append("Mint Authority غير ملغاة" if mint_rev is False else "تعذر التحقق من Mint Authority")
@@ -364,7 +358,6 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     if freeze_rev is not True:
         reasons.append("Freeze Authority غير ملغاة" if freeze_rev is False else "تعذر التحقق من Freeze Authority")
 
-    # 2) Rugged / Transfer fee / Danger risks
     if report.get("rugged") is True:
         reasons.append("التوكن مُعلَّم كـ Rugged")
     tf = report.get("transferFee")
@@ -375,7 +368,6 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     if any(str(r.get("level", "")).lower() == "danger" for r in risks):
         reasons.append("RugCheck: مخاطر بمستوى Danger")
 
-    # 3) RugCheck rating = Good
     norm = report.get("score_normalised")
     raw = report.get("score")
     rug_norm = to_float(norm, -1.0) if norm is not None else None
@@ -389,7 +381,6 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     if not rug_ok:
         reasons.append("تقييم RugCheck ليس Good")
 
-    # 4) LP burned / locked
     markets = [mk for mk in (report.get("markets") or []) if isinstance(mk, dict)]
     chosen = next((mk for mk in markets if mk.get("pubkey") == pair_address), None)
     if chosen is None and markets:
@@ -406,7 +397,6 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     elif lp_locked < MIN_LP_LOCKED_PCT:
         reasons.append("LP غير محروقة/مقفولة بالكامل")
 
-    # 5) الحيتان: Top10 (بعد استبعاد حسابات الـ Pool)، Dev، Bundles/Snipers
     pool_accounts = set()
     for mk in markets:
         for key in ("pubkey", "liquidityA", "liquidityB", "mintLP"):
@@ -437,7 +427,6 @@ def analyze_security(report: dict, pair_address: str) -> Security:
             dev = max(dev, creator_bal / supply * 100)
         if dev > MAX_DEV_PCT:
             reasons.append("حصة المطور Dev مرتفعة")
-    # (إن لم يُعرف creator لا نحجب بسبب Dev — يُعرض كـ "غير متاح")
 
     bundled = (
         any(h.get("insider") for h in real_holders)
@@ -472,7 +461,7 @@ class ScalpPlan:
     swing_high: float
     zone_low: float
     zone_high: float
-    status: str            # IN_ZONE | ABOVE_ZONE
+    status: str
     above_pct: float
     entry: float
     tp1: float
@@ -504,7 +493,6 @@ async def fetch_candles(client: httpx.AsyncClient, pool: str) -> list:
 
 
 def compute_scalp_plan(candles: list, price: float):
-    """يرجع (ScalpPlan, None) أو (None, سبب_الرفض)."""
     if len(candles) < MIN_CANDLES:
         return None, "شموع غير كافية لحساب Fibonacci"
 
@@ -564,7 +552,6 @@ def compute_scalp_plan(candles: list, price: float):
 
 
 def compute_score(m: dict, sec: Security, plan: ScalpPlan):
-    """Score /100 = سيولة/MC (25) + فوليوم (25) + زخم سعر (10) + Fibonacci (20) + أمان (20)."""
     b: dict = {}
     b["liq_mcap"] = 25 * clamp(m["liq_mcap"] / 0.10, 0, 1)
 
@@ -664,7 +651,7 @@ async def run_scan(client: httpx.AsyncClient) -> ScanResult:
     candidates = []
     for i, (m, sec) in enumerate(secure):
         if i > 0:
-            await asyncio.sleep(1.2)  # حد GeckoTerminal المجاني
+            await asyncio.sleep(1.2)
         candles = await fetch_candles(client, m["pair"])
         plan, reject = compute_scalp_plan(candles, m["price"])
         if plan is None:
@@ -856,9 +843,25 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Unhandled exception", exc_info=context.error)
 
 
+async def handle_health_check(request):
+    return web.Response(text="OK", status=200)
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_get("/", handle_health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    log.info(f"Health check server running on port {port}")
+
+
 def main() -> None:
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("TELEGRAM_BOT_TOKEN غير مضبوط في متغيرات البيئة.")
+    
     app = (
         Application.builder()
         .token(TELEGRAM_BOT_TOKEN)
@@ -867,12 +870,21 @@ def main() -> None:
         .post_shutdown(post_shutdown)
         .build()
     )
+    
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_error_handler(on_error)
-    log.info("SolAlpha Sniper is running (polling)...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+
+    async def run_all():
+        await start_web_server()
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+        log.info("SolAlpha Sniper is running (polling + web)...")
+        await asyncio.Event().wait()
+
+    asyncio.run(run_all())
 
 
 if __name__ == "__main__":
