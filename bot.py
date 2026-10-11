@@ -1,17 +1,6 @@
 # -*- coding: utf-8 -*-
 """
 SolAlpha Sniper — Telegram bot (Render Web Service)
-
-الأمر /best يقوم بمسح مباشر لسوق Solana ويطبق خط فلترة صارم:
-  1) اكتشاف العملات: DexScreener + GeckoTerminal (+ Birdeye اختياري)
-  2) فلترة السيولة/الفوليوم/الزخم (Volume Spike)
-  3) فلترة أمنية مطلقة عبر RugCheck (Mint/Freeze/LP/Dev/Top10/Bundles)
-  4) خطة سكالبيج بمنطقة Fibonacci Golden Zone (0.5 - 0.618) من شموع GeckoTerminal
-  5) Score /100 — أي عملة أقل من 80 تُحجب
-
-متغيرات البيئة:
-  TELEGRAM_BOT_TOKEN   (مطلوب)
-  BIRDEYE_API_KEY      (اختياري — مصدر إضافي للعملات الرائجة)
 """
 
 import asyncio
@@ -173,6 +162,18 @@ async def _dex_token_lists(client: httpx.AsyncClient) -> list:
     return out
 
 
+async def _dex_search_fallback(client: httpx.AsyncClient) -> list:
+    data = await fetch_json(client, f"{DEX}/latest/dex/search?q=solana")
+    out = []
+    pairs = data.get("pairs") if isinstance(data, dict) else None
+    for p in pairs or []:
+        if isinstance(p, dict) and p.get("chainId") == "solana":
+            base = (p.get("baseToken") or {}).get("address")
+            if base:
+                out.append(base)
+    return out
+
+
 async def _gecko_tokens(client: httpx.AsyncClient, path: str, params: Optional[dict] = None) -> list:
     data = await fetch_json(client, f"{GECKO}/networks/solana/{path}", params=params)
     out = []
@@ -202,8 +203,8 @@ async def _birdeye_tokens(client: httpx.AsyncClient) -> list:
 async def discover_token_addresses(client: httpx.AsyncClient) -> list:
     results = await asyncio.gather(
         _dex_token_lists(client),
+        _dex_search_fallback(client),
         _gecko_tokens(client, "trending_pools", {"duration": "1h"}),
-        _gecko_tokens(client, "trending_pools", {"duration": "5m"}),
         _gecko_tokens(client, "new_pools"),
         _birdeye_tokens(client),
         return_exceptions=True,
@@ -213,8 +214,11 @@ async def discover_token_addresses(client: httpx.AsyncClient) -> list:
         if isinstance(r, Exception):
             log.warning("Discovery source failed: %s", r)
             continue
-        addrs.extend(r)
-    return list(dict.fromkeys(a for a in addrs if a and a not in EXCLUDED_MINTS))[:MAX_DISCOVERED_TOKENS]
+        if isinstance(r, list):
+            addrs.extend(r)
+    unique_addrs = list(dict.fromkeys(a for a in addrs if a and a not in EXCLUDED_MINTS))[:MAX_DISCOVERED_TOKENS]
+    log.info(f"Discovered {len(unique_addrs)} unique token addresses.")
+    return unique_addrs
 
 
 async def fetch_pairs(client: httpx.AsyncClient, addresses: list) -> list:
@@ -775,7 +779,10 @@ HELP = (
 async def post_init(application: Application) -> None:
     application.bot_data["http"] = httpx.AsyncClient(
         timeout=httpx.Timeout(15.0),
-        headers={"User-Agent": "SolAlphaSniper/1.0", "Accept": "application/json"},
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/json",
+        },
         follow_redirects=True,
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
@@ -805,7 +812,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = time.time()
     last = bd["cooldowns"].get(user.id, 0)
     if now - last < USER_COOLDOWN_SEC:
-        wait = int(USER_COoldown_SEC - (now - last)) + 1 if 'USER_COOLDOWN_SEC' in globals() else 30
+        wait = int(USER_COOLDOWN_SEC - (now - last)) + 1
         await msg.reply_text(f"⏱️ انتظر {wait} ثانية قبل فحص جديد.")
         return
     bd["cooldowns"][user.id] = now
@@ -876,7 +883,6 @@ def main() -> None:
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_error_handler(on_error)
 
-    # تشغيل سيرفر الويب في الخلفية عبر حلقة الأحداث بالتوازي مع البوت
     loop = asyncio.get_event_loop()
     loop.run_until_complete(start_web_server())
 
