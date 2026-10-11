@@ -17,7 +17,7 @@ SolAlpha Sniper v2 — Telegram bot (Render Web Service + Health Check)
 
 متغيرات البيئة:
   TELEGRAM_BOT_TOKEN (مطلوب) | PORT (تضبطه Render) | BIRDEYE_API_KEY | JUPITER_API_KEY (اختياريان)
-  MIN_SCORE, WATCH_MIN_SCORE, MIN_LIQUIDITY_USD, MIN_VOLUME_H1_USD, BLOCK_INSIDERS ... إلخ
+  MIN_SCORE, WATCH_MIN_SCORE, MIN_LIQUIDITY_USD, MIN_VOLUME_H1_USD, ALLOW_RISKY ... إلخ
 """
 
 import asyncio
@@ -70,7 +70,13 @@ MAX_TOP10_PCT = _env_float("MAX_TOP10_PCT", 25)
 MIN_LP_LOCKED_PCT = _env_float("MIN_LP_LOCKED_PCT", 95)
 RUGCHECK_MAX_NORM = _env_float("RUGCHECK_MAX_NORM", 20)
 RUGCHECK_MAX_RAW = _env_float("RUGCHECK_MAX_RAW", 500)
-BLOCK_INSIDERS = _env_float("BLOCK_INSIDERS", 1) >= 1    # 1 = حظر تام لأنماط Bundled/Insider
+# المستوى B (مخاطرة أعلى): يُسمح به فقط إن اجتاز الحظر الصلب (Mint/Freeze/LP/Rugged/Danger)
+ALLOW_RISKY = _env_float("ALLOW_RISKY", 1) >= 1          # 0 = المستوى A فقط (صارم تماماً)
+RISKY_MAX_TOP10_PCT = _env_float("RISKY_MAX_TOP10_PCT", 45)
+RISKY_MAX_DEV_PCT = _env_float("RISKY_MAX_DEV_PCT", 10)
+RISKY_MAX_RUG_NORM = _env_float("RISKY_MAX_RUG_NORM", 50)
+RISKY_MIN_SCORE = _env_float("RISKY_MIN_SCORE", 65)
+RISK_PENALTY = 8
 
 # Fibonacci
 MIN_CANDLES = 20
@@ -84,10 +90,10 @@ TP1_PCT = 0.18
 TP2_PCT = 0.25
 
 MAX_DISCOVERED_TOKENS = 300
-MAX_SECURITY_CHECKS = int(_env_float("MAX_SECURITY_CHECKS", 15))
+MAX_SECURITY_CHECKS = int(_env_float("MAX_SECURITY_CHECKS", 25))
 SCAN_TIMEOUT_SEC = 150
 USER_COOLDOWN_SEC = 30
-SCAN_CACHE_SEC = 45
+SCAN_CACHE_SEC = 20
 RUGCHECK_CACHE_SEC = 600
 
 DEX = "https://api.dexscreener.com"
@@ -392,6 +398,8 @@ class Security:
     lp_locked: Optional[float] = None
     rug_norm: Optional[float] = None
     rug_raw: Optional[float] = None
+    warnings: list = field(default_factory=list)   # أسباب المستوى B (مخاطرة أعلى)
+    bundled: bool = False
 
 
 _RUG_CACHE: dict = {}
@@ -410,7 +418,8 @@ async def get_rugcheck_report(client: httpx.AsyncClient, mint: str) -> Optional[
 
 
 def analyze_security(report: dict, pair_address: str) -> Security:
-    reasons: list = []
+    reasons: list = []   # حظر صلب
+    soft: list = []      # مخاطرة أعلى (المستوى B)
     token = report.get("token") if isinstance(report.get("token"), dict) else {}
 
     def authority_revoked(key: str) -> Optional[bool]:
@@ -441,13 +450,15 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     rug_norm = to_float(norm, -1.0) if norm is not None else None
     rug_raw = to_float(raw, -1.0) if raw is not None else None
     if rug_norm is not None:
-        rug_ok = rug_norm <= RUGCHECK_MAX_NORM
+        if rug_norm > RISKY_MAX_RUG_NORM:
+            reasons.append("تقييم RugCheck سيئ")
+        elif rug_norm > RUGCHECK_MAX_NORM:
+            soft.append(f"RugCheck ليس Good (خطورة {rug_norm:.0f}/100)")
     elif rug_raw is not None:
-        rug_ok = rug_raw <= RUGCHECK_MAX_RAW
+        if rug_raw > RUGCHECK_MAX_RAW:
+            reasons.append("تقييم RugCheck سيئ")
     else:
-        rug_ok = False
-    if not rug_ok:
-        reasons.append("تقييم RugCheck ليس Good")
+        reasons.append("تعذر قراءة تقييم RugCheck")
 
     markets = [mk for mk in (report.get("markets") or []) if isinstance(mk, dict)]
     chosen = next((mk for mk in markets if mk.get("pubkey") == pair_address), None)
@@ -479,8 +490,10 @@ def analyze_security(report: dict, pair_address: str) -> Security:
     top10 = sum(to_float(h.get("pct")) for h in real_holders[:10])
     if not all_holders:
         reasons.append("تعذر جلب بيانات الحيتان")
+    elif top10 > RISKY_MAX_TOP10_PCT:
+        reasons.append("تركّز كبار الملاك Top10 مرتفع جداً")
     elif top10 > MAX_TOP10_PCT:
-        reasons.append("تركّز كبار الملاك Top10 مرتفع")
+        soft.append(f"Top10 مرتفع ({top10:.0f}%)")
 
     dev: Optional[float] = None
     creator = report.get("creator")
@@ -493,8 +506,10 @@ def analyze_security(report: dict, pair_address: str) -> Security:
         creator_bal = to_float(report.get("creatorBalance"))
         if supply > 0 and creator_bal > 0:
             dev = max(dev, creator_bal / supply * 100)
-        if dev > MAX_DEV_PCT:
-            reasons.append("حصة المطور Dev مرتفعة")
+        if dev > RISKY_MAX_DEV_PCT:
+            reasons.append("حصة المطور Dev مرتفعة جداً")
+        elif dev > MAX_DEV_PCT:
+            soft.append(f"حصة المطور {dev:.1f}%")
 
     bundled = (
         any(h.get("insider") for h in real_holders)
@@ -506,12 +521,18 @@ def analyze_security(report: dict, pair_address: str) -> Security:
             for kw in ("bundl", "snip", "insider")
         )
     )
-    if bundled and BLOCK_INSIDERS:
-        reasons.append("أنماط Bundled/Sniped/Insider")
+    if bundled:
+        soft.append("أنماط Bundled/Sniped/Insider")
+
+    if soft and not ALLOW_RISKY:
+        reasons.extend(soft)
+        soft = []
 
     return Security(
         passed=not reasons,
         reasons=reasons,
+        warnings=soft,
+        bundled=bundled,
         top10=top10,
         dev=dev,
         lp_locked=lp_locked,
@@ -651,9 +672,10 @@ def compute_score(m: dict, sec: Security, plan: ScalpPlan):
     else:
         safety += 5
     b["safety"] = safety
+    b["risk_penalty"] = -RISK_PENALTY if sec.warnings else 0.0
 
     total = int(round(sum(b.values())))
-    return min(total, 100), b
+    return int(clamp(total, 0, 100)), b
 
 
 # ───────────────────────────── المسح الكامل ─────────────────────────────
@@ -671,6 +693,7 @@ class Candidate:
 @dataclass
 class ScanResult:
     best: Optional[Candidate] = None
+    risky: Optional[Candidate] = None
     watch: list = field(default_factory=list)
     stats: Counter = field(default_factory=Counter)
     sources: dict = field(default_factory=dict)
@@ -733,13 +756,18 @@ async def run_scan(client: httpx.AsyncClient) -> ScanResult:
         score, breakdown = compute_score(m, sec, plan)
         candidates.append(Candidate(m, sec, plan, score, breakdown))
 
-    signals = [c for c in candidates if c.plan.status != "WAIT" and c.score >= MIN_SCORE]
-    if signals:
-        res.best = max(signals, key=lambda c: c.score)
-    watch = [c for c in candidates if c is not res.best and c.score >= WATCH_MIN_SCORE]
+    clean = [c for c in candidates if not c.sec.warnings and c.plan.status != "WAIT" and c.score >= MIN_SCORE]
+    if clean:
+        res.best = max(clean, key=lambda c: c.score)
+    else:
+        risky = [c for c in candidates if c.sec.warnings and c.plan.status != "WAIT" and c.score >= RISKY_MIN_SCORE]
+        if risky:
+            res.risky = max(risky, key=lambda c: c.score)
+    chosen = res.best or res.risky
+    watch = [c for c in candidates if c is not chosen and c.score >= WATCH_MIN_SCORE]
     watch.sort(key=lambda c: c.score, reverse=True)
     res.watch = watch[:3]
-    below = [c for c in candidates if c is not res.best and c.score < WATCH_MIN_SCORE]
+    below = [c for c in candidates if c is not chosen and c.score < WATCH_MIN_SCORE]
     if below:
         res.stats[f"Score أقل من {WATCH_MIN_SCORE:.0f}"] += len(below)
     res.finished_at = time.time()
@@ -762,16 +790,30 @@ def format_best(c: Candidate) -> str:
         status = f"⏳ السعر أعلى المنطقة بـ {p.above_pct:.1f}% — انتظر الارتداد (Limit داخل المنطقة)"
 
     dev_txt = f"{s.dev:.1f}%" if s.dev is not None else "غير متاح"
-    rug_txt = f"Good (خطورة {s.rug_norm:.0f}/100)" if s.rug_norm is not None else f"Good (raw {s.rug_raw:.0f})"
+    rug_txt = f"خطورة {s.rug_norm:.0f}/100" if s.rug_norm is not None else f"raw {s.rug_raw:.0f}"
     b = c.breakdown
+    risky = bool(s.warnings)
+    title = (
+        "⚠️ <b>SolAlpha Sniper — فرصة بمخاطرة أعلى (المستوى B)</b>"
+        if risky else "🎯 <b>SolAlpha Sniper — أفضل فرصة حالياً</b>"
+    )
+    warn_block = ""
+    if risky:
+        warn_block = (
+            "🚨 <b>تحذيرات:</b> " + " • ".join(html.escape(w) for w in s.warnings) + "\n"
+            "<i>اجتازت الحظر الصلب (Mint/Freeze/LP/Danger) لكنها ليست نظيفة. إن دخلت فبحجم صغير جداً.</i>\n\n"
+        )
+    bundle_txt = "🚨 مرصودة أنماط Bundled/Insider" if s.bundled else "✅ لا يوجد"
 
     return (
-        f"🎯 <b>SolAlpha Sniper — أفضل فرصة حالياً</b>\n\n"
+        f"{title}\n\n"
+        f"{warn_block}"
         f"🪙 <b>{name}</b> (${sym})\n"
         f"📋 العقد CA (اضغط للنسخ):\n<code>{m['mint']}</code>\n\n"
         f"📊 <b>التقييم: {c.score}/100</b>\n"
         f"<i>سيولة/MC {b['liq_mcap']:.0f}/20 • فوليوم {b['volume']:.0f}/20 • زخم {b['momentum']:.0f}/10 "
-        f"• Fib {b['fib']:.0f}/25 • أمان {b['safety']:.0f}/25</i>\n\n"
+        f"• Fib {b['fib']:.0f}/25 • أمان {b['safety']:.0f}/25"
+        f"{' • عقوبة مخاطرة −' + str(RISK_PENALTY) if risky else ''}</i>\n\n"
         f"🛡️ <b>الأمان والسيولة</b>\n"
         f"• Mint ✅ ملغاة | Freeze ✅ ملغاة\n"
         f"• LP: {s.lp_locked:.0f}% محروقة/مقفولة 🔒\n"
@@ -779,7 +821,7 @@ def format_best(c: Candidate) -> str:
         f"• السيولة: {fmt_usd(m['liq'])} | MC: {fmt_usd(m['mcap'])} | Liq/MC: {m['liq_mcap'] * 100:.1f}%\n\n"
         f"🐋 <b>الحيتان</b>\n"
         f"• Top10: {s.top10:.1f}% | Dev: {dev_txt}\n"
-        f"• Bundled/Snipers: ✅ لا يوجد\n\n"
+        f"• Bundled/Snipers: {bundle_txt}\n\n"
         f"⚡ <b>الزخم</b>\n"
         f"• 5m: {m['chg5']:+.1f}% | 1h: {m['chg1']:+.1f}%\n"
         f"• وتيرة فوليوم 5m: ×{m['vol_pace']:.1f} | الساعة مقابل متوسط 6h: ×{m['h1_vs_h6']:.1f}\n"
@@ -851,13 +893,13 @@ WELCOME = (
 )
 
 HELP = (
-    "🛡️ <b>الفلاتر الأمنية الإلزامية (فشل واحد = استبعاد)</b>\n"
+    "🛡️ <b>حظر صلب دائماً (لا يُخفَّف أبداً)</b>\n"
     "• Mint & Freeze Authority ملغاتان\n"
     f"• LP محروقة/مقفولة (≥ {MIN_LP_LOCKED_PCT:.0f}%)\n"
-    f"• Dev ≤ {MAX_DEV_PCT:.0f}% و Top10 ≤ {MAX_TOP10_PCT:.0f}%\n"
-    "• لا Bundled / Sniped / Insider wallets\n"
-    "• تقييم RugCheck = Good\n\n"
-    f"📊 الإشارة النهائية: Score ≥ {MIN_SCORE:.0f}/100 والسعر داخل/قرب Golden Zone.\n"
+    "• ليست Rugged ولا Danger في RugCheck\n\n"
+    f"🧼 <b>المستوى A</b>: Dev ≤ {MAX_DEV_PCT:.0f}% و Top10 ≤ {MAX_TOP10_PCT:.0f}% وبلا Bundled/Insider وRugCheck Good.\n\n"
+    f"📊 المستوى A (نظيف): Score ≥ {MIN_SCORE:.0f}/100 والسعر داخل/قرب Golden Zone.\n"
+    f"⚠️ المستوى B (مخاطرة أعلى): يجتاز الحظر الصلب فقط، Score ≥ {RISKY_MIN_SCORE:.0f}، ويُعرض بتحذيرات واضحة.\n"
     f"👀 المراقبة: عملات آمنة بتقييم ≥ {WATCH_MIN_SCORE:.0f} لم تكتمل شروط دخولها.\n\n"
     "📈 <b>الخطة:</b> دخول من Golden Zone (0.5–0.618)، TP1 +18%، TP2 +25%، SL تحت القاع بـ 1.5%."
 )
@@ -920,8 +962,15 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                     res = cached
                 else:
                     res = await asyncio.wait_for(run_scan(bd["http"]), timeout=SCAN_TIMEOUT_SEC)
-                    bd["last_scan"] = res
-        text = format_best(res.best) if res.best else format_no_result(res)
+                    bd["last_scan"] = res if res.discovered > 0 else None  # لا نخزّن نتيجة فاشلة
+        if res.discovered == 0:
+            text = "⚠️ تعذر جلب بيانات السوق (المصادر لم ترجع شيئاً — غالباً حدّ طلبات). جرّب بعد دقيقة، أو /diag."
+        elif res.best:
+            text = format_best(res.best)
+        elif res.risky:
+            text = format_best(res.risky)
+        else:
+            text = format_no_result(res)
     except asyncio.TimeoutError:
         text = "⌛ انتهت مهلة المسح (المصادر بطيئة). حاول مجدداً بعد قليل."
     except Exception:
