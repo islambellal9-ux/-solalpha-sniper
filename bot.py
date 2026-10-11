@@ -805,7 +805,7 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     now = time.time()
     last = bd["cooldowns"].get(user.id, 0)
     if now - last < USER_COOLDOWN_SEC:
-        wait = int(USER_COOLDOWN_SEC - (now - last)) + 1
+        wait = int(USER_COoldown_SEC - (now - last)) + 1 if 'USER_COOLDOWN_SEC' in globals() else 30
         await msg.reply_text(f"⏱️ انتظر {wait} ثانية قبل فحص جديد.")
         return
     bd["cooldowns"][user.id] = now
@@ -876,15 +876,12 @@ def main() -> None:
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_error_handler(on_error)
 
-    async def run_all():
-        await start_web_server()
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
-        log.info("SolAlpha Sniper is running (polling + web)...")
-        await asyncio.Event().wait()
+    # تشغيل سيرفر الويب في الخلفية عبر حلقة الأحداث بالتوازي مع البوت
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(start_web_server())
 
-    asyncio.run(run_all())
+    log.info("SolAlpha Sniper is running (polling + web)...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 
 if __name__ == "__main__":
