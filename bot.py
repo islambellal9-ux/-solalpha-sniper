@@ -58,7 +58,7 @@ MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 15_000)
 MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 8_000)
 MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 30_000)
 MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 1_000_000)   # الافتراضي: عملات أقل من 1M (غيّره بـ /best 5m)
-MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 45)
+MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 20)
 MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)
 MAX_5M_DROP_PCT = _env_float("MAX_5M_DROP_PCT", 10)
 MAX_1H_DROP_PCT = _env_float("MAX_1H_DROP_PCT", 25)
@@ -124,6 +124,8 @@ GECKO_SOURCES = (
     ("GeckoTerminal top volume p2", "pools", {"sort": "h24_volume_usd_desc", "page": 2}),
     ("GeckoTerminal top tx count p2", "pools", {"sort": "h24_tx_count_desc", "page": 2}),
     ("GeckoTerminal top tx count p3", "pools", {"sort": "h24_tx_count_desc", "page": 3}),
+    ("GeckoTerminal new pools p1", "new_pools", {"page": 1}),
+    ("GeckoTerminal new pools p2", "new_pools", {"page": 2}),
 )
 
 EXCLUDED_MINTS = {
@@ -667,22 +669,22 @@ def compute_scalp_plan(candles: list, price: float):
 
 def momentum_ok(m: dict) -> bool:
     return (
-        3 <= m["chg1"] <= 150
-        and m["chg5"] >= -1
-        and m["vol_pace"] >= 0.8
-        and m["buy_ratio5"] >= 0.45
+        2 <= m["chg1"] <= 200
+        and m["chg5"] >= -3
+        and m["vol_pace"] >= 0.5
+        and m["buy_ratio5"] >= 0.40
     )
 
 
 def hold_ok(m: dict) -> bool:
     age = m["age_min"] or 0
     return (
-        age >= 1440
-        and m["liq"] >= 40_000
+        age >= 720
+        and m["liq"] >= 30_000
         and m["chg24"] > 0
         and m["chg1"] >= -5
         and m["mcap"] > 0
-        and m["vol24"] / m["mcap"] >= 0.2
+        and m["vol24"] / m["mcap"] >= 0.15
     )
 
 
@@ -690,11 +692,11 @@ def compute_alt_plan(kind: str, m: dict, candles: list) -> ScalpPlan:
     price = m["price"]
     if kind == "MOMENTUM":
         zone_low, zone_high = price * 0.97, price
-        tp1, tp2 = price * 1.15, price * 1.30
-        sl = price * 0.88
+        tp1, tp2 = price * 1.20, price * 1.45
+        sl = price * 0.91
         if candles:
             recent_low = min(c[3] for c in candles[-8:])
-            sl = clamp(recent_low * 0.985, price * 0.85, price * 0.93)
+            sl = clamp(recent_low * 0.985, price * 0.88, price * 0.94)
     else:  # HOLD
         zone_low, zone_high = price * 0.92, price
         tp1, tp2 = price * 1.50, price * 2.00
@@ -859,6 +861,9 @@ def grade_of(c: Candidate) -> str:
     return "🟠 ضعيفة (مضاربة)"
 
 
+_DISCOVERY_CACHE: dict = {"ts": 0.0, "addrs": []}
+
+
 async def run_scan(
     client: httpx.AsyncClient,
     progress=None,
@@ -898,6 +903,13 @@ async def run_scan(
         addrs, res.sources = await discover_token_addresses(
             client, timeout=min(35.0, left()), extra=list(whale_map)
         )
+
+    global _DISCOVERY_CACHE
+    if addrs:
+        _DISCOVERY_CACHE = {"ts": time.time(), "addrs": list(addrs)}
+    elif not whale_only and time.time() - _DISCOVERY_CACHE["ts"] < 900 and _DISCOVERY_CACHE["addrs"]:
+        addrs = list(_DISCOVERY_CACHE["addrs"])
+        res.stats["فشلت مصادر الاكتشاف — استُخدمت قائمة محفوظة (<15 دقيقة)"] += 1
 
     # 2) بيانات الأزواج
     await say(f"📊 (2/4) جلب بيانات {len(addrs)} عملة...")
@@ -1082,7 +1094,7 @@ def format_best(c: Candidate, alts: list) -> str:
         )
     else:
         note = (
-            "لا تطارد السعر إن ارتفع أكثر من 5% عن منطقة الدخول."
+            "لا تطارد السعر إن ارتفع أكثر من 5%. بع نصف الكمية عند TP1 وانقل SL إلى سعر الدخول."
             if p.kind == "MOMENTUM"
             else "صفقة أبطأ: راقبها يومياً، ولا تعتمد على شمعة واحدة."
         )
@@ -1142,6 +1154,84 @@ def to_plain(text: str) -> str:
     return html.unescape(re.sub(r"<[^>]+>", "", text))
 
 
+# ───────────────────────────── تتبع نتائج الصفقات (لمعرفة أي استراتيجية تنجح فعلاً) ─────────────────────────────
+
+SIGNALS: list = []
+TRACK_INTERVAL_SEC = 180
+TRACK_MAX_AGE_SEC = 4 * 3600
+
+
+def record_signal(c: Candidate, chat_id: int) -> None:
+    now = time.time()
+    for s_ in SIGNALS:
+        if s_["mint"] == c.m["mint"] and s_["kind"] == c.plan.kind and now - s_["ts"] < SEEN_TTL_SEC:
+            return
+    SIGNALS.append({
+        "mint": c.m["mint"], "name": c.m["name"], "kind": c.plan.kind, "ts": now,
+        "entry": c.m["price"], "tp1": c.plan.tp1, "sl": c.plan.sl, "score": c.score,
+        "risky": bool(c.sec.warnings), "outcome": None, "pnl": 0.0, "last": c.m["price"],
+    })
+    if len(SIGNALS) > 500:
+        del SIGNALS[:100]
+
+
+async def update_signals(client: httpx.AsyncClient) -> None:
+    now = time.time()
+    open_sigs = [s_ for s_ in SIGNALS if s_["outcome"] is None]
+    if not open_sigs:
+        return
+    pairs = await fetch_pairs(client, list({s_["mint"] for s_ in open_sigs}))
+    prices = {(p.get("baseToken") or {}).get("address"): to_float(p.get("priceUsd")) for p in pairs}
+    for s_ in open_sigs:
+        price = prices.get(s_["mint"], 0.0)
+        expired = now - s_["ts"] > TRACK_MAX_AGE_SEC
+        if price <= 0:
+            if expired:
+                s_["outcome"] = "NOPRICE"
+            continue
+        s_["last"] = price
+        if price >= s_["tp1"]:
+            s_["outcome"], s_["pnl"] = "TP1", (s_["tp1"] / s_["entry"] - 1) * 100
+        elif price <= s_["sl"]:
+            s_["outcome"], s_["pnl"] = "SL", (s_["sl"] / s_["entry"] - 1) * 100
+        elif expired:
+            s_["outcome"], s_["pnl"] = "EXP", (price / s_["entry"] - 1) * 100
+
+
+async def tracker_loop(client: httpx.AsyncClient) -> None:
+    while True:
+        await asyncio.sleep(TRACK_INTERVAL_SEC)
+        try:
+            await update_signals(client)
+        except Exception:
+            log.exception("Tracker failed")
+
+
+def format_stats() -> str:
+    if not SIGNALS:
+        return "📊 لا توجد صفقات مسجّلة بعد. اطلب /best واترك البوت يعمل ساعات ثم ارجع."
+    lines = ["📊 <b>نتائج الصفقات المعروضة</b> (تقديرية: فحص كل 3 دقائق، مهلة 4 ساعات)", ""]
+    for kind in ("SCALP", "MOMENTUM", "HOLD"):
+        rows = [s_ for s_ in SIGNALS if s_["kind"] == kind]
+        if not rows:
+            continue
+        win = sum(1 for r in rows if r["outcome"] == "TP1")
+        loss = sum(1 for r in rows if r["outcome"] == "SL")
+        exp = sum(1 for r in rows if r["outcome"] == "EXP")
+        dead = sum(1 for r in rows if r["outcome"] == "NOPRICE")
+        opn = sum(1 for r in rows if r["outcome"] is None)
+        closed = [r for r in rows if r["outcome"] in ("TP1", "SL", "EXP")]
+        avg = sum(r["pnl"] for r in closed) / len(closed) if closed else 0.0
+        rate = f"{win / (win + loss) * 100:.0f}%" if (win + loss) else "—"
+        lines.append(
+            f"{KIND_SHORT[kind]}: {len(rows)} صفقة • ✅ TP1 {win} • 🛑 SL {loss} • ⌛ انتهت {exp}"
+            f" • 🔄 مفتوحة {opn}" + (f" • ☠️ بلا سعر {dead}" if dead else "")
+        )
+        lines.append(f"   نسبة نجاح (TP1 مقابل SL): {rate} • متوسط النتيجة: {avg:+.1f}%")
+    lines += ["", "ℹ️ العينة الصغيرة لا تثبت شيئاً؛ انتظر 30 صفقة على الأقل لكل نوع. تُمسح الأرقام عند إعادة تشغيل الخدمة."]
+    return "\n".join(lines)
+
+
 # ───────────────────────────── أوامر تلغرام ─────────────────────────────
 
 WELCOME = (
@@ -1150,6 +1240,7 @@ WELCOME = (
     "• /best — أفضل صفقة الآن + بدائل (لا تتكرر نفس العملة)\n"
     "• /best 500k — بحد أقصى للماركت كاب (الافتراضي 1M)\n"
     "• /whales — عملات اشترتها محافظ الحيتان التي تتبعها\n"
+    "• /stats — نتائج الصفقات التي عرضها البوت (أي نوع ينجح فعلاً)\n"
     "• /diag — تشخيص مصادر البيانات\n"
     "• /help — شرح الأنواع والفلاتر\n\n"
     "⚠️ أداة تحليل وليست نصيحة مالية."
@@ -1315,6 +1406,8 @@ async def scan_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, wha
                 )
             text = note + format_best(best, alts)
             seen[best.m["mint"]] = now
+            for tracked in [best] + alts:
+                record_signal(tracked, update.effective_chat.id)
         else:
             text = format_no_result(res)
     except asyncio.TimeoutError:
@@ -1328,6 +1421,10 @@ async def scan_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, wha
 
 async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await scan_and_reply(update, context, False)
+
+
+async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(format_stats(), parse_mode=ParseMode.HTML)
 
 
 async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1429,6 +1526,7 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
     app.add_handler(CommandHandler("whales", whales_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_error_handler(on_error)
 
     runner = await start_web_server()
@@ -1437,6 +1535,7 @@ async def run_all() -> None:
     await app.start()
     await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
     keepalive = asyncio.create_task(keepalive_loop(app.bot_data["http"]))
+    tracker = asyncio.create_task(tracker_loop(app.bot_data["http"]))
     log.info("SolAlpha Sniper v3 is running (polling + web)...")
 
     stop = asyncio.Event()
@@ -1452,6 +1551,7 @@ async def run_all() -> None:
     finally:
         log.info("Shutting down...")
         keepalive.cancel()
+        tracker.cancel()
         try:
             await app.updater.stop()
             await app.stop()
