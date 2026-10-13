@@ -57,7 +57,7 @@ RISKY_MIN_SCORE = _env_float("RISKY_MIN_SCORE", 65)  # 🟡 متوسطة
 MIN_LIQUIDITY_USD = _env_float("MIN_LIQUIDITY_USD", 15_000)
 MIN_VOLUME_H1_USD = _env_float("MIN_VOLUME_H1_USD", 8_000)
 MIN_MCAP_USD = _env_float("MIN_MCAP_USD", 30_000)
-MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 100_000_000)
+MAX_MCAP_USD = _env_float("MAX_MCAP_USD", 1_000_000)   # الافتراضي: عملات أقل من 1M (غيّره بـ /best 5m)
 MIN_PAIR_AGE_MIN = _env_float("MIN_PAIR_AGE_MIN", 45)
 MAX_H1_CHANGE_PCT = _env_float("MAX_H1_CHANGE_PCT", 300)
 MAX_5M_DROP_PCT = _env_float("MAX_5M_DROP_PCT", 10)
@@ -94,6 +94,13 @@ USER_COOLDOWN_SEC = 15
 SCAN_CACHE_SEC = 20
 RUGCHECK_CACHE_SEC = 600
 KEEPALIVE_SEC = 540
+SEEN_TTL_SEC = _env_float("SEEN_TTL_SEC", 3 * 3600)   # لا تكرر نفس العملة قبل مرور هذه المدة
+
+# تتبع الحيتان (اختياري): مفتاح Helius + قائمة محافظ تختارها أنت
+HELIUS_API_KEY = os.getenv("HELIUS_API_KEY", "").strip()
+WHALE_WALLETS = [w.strip() for w in os.getenv("WHALE_WALLETS", "").replace("\n", ",").split(",") if w.strip()]
+WHALE_LOOKBACK_MIN = _env_float("WHALE_LOOKBACK_MIN", 120)
+HELIUS = "https://api.helius.xyz"
 
 DEX = "https://api.dexscreener.com"
 GECKO = "https://api.geckoterminal.com/api/v2"
@@ -114,6 +121,9 @@ GECKO_SOURCES = (
     ("GeckoTerminal top volume", "pools", {"sort": "h24_volume_usd_desc", "page": 1}),
     ("GeckoTerminal top tx count", "pools", {"sort": "h24_tx_count_desc"}),
     ("GeckoTerminal trending 5m", "trending_pools", {"duration": "5m"}),
+    ("GeckoTerminal top volume p2", "pools", {"sort": "h24_volume_usd_desc", "page": 2}),
+    ("GeckoTerminal top tx count p2", "pools", {"sort": "h24_tx_count_desc", "page": 2}),
+    ("GeckoTerminal top tx count p3", "pools", {"sort": "h24_tx_count_desc", "page": 3}),
 )
 
 EXCLUDED_MINTS = {
@@ -249,7 +259,7 @@ async def _birdeye_tokens(client: httpx.AsyncClient) -> list:
     return [t["address"] for t in (tokens or []) if isinstance(t, dict) and t.get("address")]
 
 
-async def discover_token_addresses(client: httpx.AsyncClient, timeout: float = 35.0):
+async def discover_token_addresses(client: httpx.AsyncClient, timeout: float = 35.0, extra: Optional[list] = None):
     """يرجع (العناوين، عدد النتائج لكل مصدر). يعيد ما جمعه حتى لو انتهت المهلة."""
     counts: dict = {}
     buckets: dict = {}
@@ -291,7 +301,7 @@ async def discover_token_addresses(client: httpx.AsyncClient, timeout: float = 3
         + [n for n, _, _ in GECKO_SOURCES]
         + [n for n, _ in named if not n.startswith("Jupiter")]
     )
-    merged: list = []
+    merged: list = list(extra or [])
     for n in order:
         merged.extend(buckets.get(n, []))
         counts.setdefault(n, 0)
@@ -358,6 +368,8 @@ def extract_metrics(pair: dict) -> Optional[dict]:
         "buys5": to_float(t5.get("buys")),
         "sells5": to_float(t5.get("sells")),
         "age_min": age_min,
+        "whale_count": 0,
+        "whale_age": None,
     }
     m["vol_pace"] = (m["vol5"] * 12 / m["vol1"]) if m["vol1"] > 0 else 0.0
     m["h1_vs_h6"] = (m["vol1"] / (m["vol6"] / 6)) if m["vol6"] > 0 else 0.0
@@ -367,14 +379,14 @@ def extract_metrics(pair: dict) -> Optional[dict]:
     return m
 
 
-def pre_filter(m: dict) -> Optional[str]:
+def pre_filter(m: dict, max_mcap: Optional[float] = None) -> Optional[str]:
     if m["dex"] == "pumpfun":
         return "لم تهاجر من Bonding Curve بعد"
     if m["price"] <= 0:
         return "بيانات سعر غير صالحة"
     if m["liq"] < MIN_LIQUIDITY_USD:
         return "سيولة منخفضة"
-    if not (MIN_MCAP_USD <= m["mcap"] <= MAX_MCAP_USD):
+    if not (MIN_MCAP_USD <= m["mcap"] <= (max_mcap or MAX_MCAP_USD)):
         return "الماركت كاب خارج النطاق"
     if m["age_min"] is None or m["age_min"] < MIN_PAIR_AGE_MIN:
         return "عمر الزوج قصير جداً"
@@ -393,6 +405,7 @@ def prelim_rank(m: dict) -> float:
         + min(m["h1_vs_h6"], 6) / 2
         + min(m["liq_mcap"], 0.2) * 10
         + (1.0 if m["chg1"] > 0 else 0.0)
+        + 3.0 * m.get("whale_count", 0)
     )
 
 
@@ -746,8 +759,72 @@ def compute_score(m: dict, sec: Security, plan: ScalpPlan):
     b["safety"] = safety
     b["risk_penalty"] = -RISK_PENALTY if sec.warnings else 0.0
 
+    b["whales"] = min(15.0, 7.0 * m.get("whale_count", 0))
+
     total = int(round(sum(b.values())))
     return int(clamp(total, 0, 100)), b
+
+
+# ───────────────────────────── تتبع الحيتان (Helius) ─────────────────────────────
+
+
+def whale_enabled() -> bool:
+    return bool(HELIUS_API_KEY and WHALE_WALLETS)
+
+
+async def fetch_wallet_trades(client: httpx.AsyncClient, wallet: str):
+    """يرجع (مشتريات {mint: ts}, مبيعات {mint: ts}) لآخر WHALE_LOOKBACK_MIN دقيقة."""
+    data = await fetch_json(
+        client,
+        f"{HELIUS}/v0/addresses/{wallet}/transactions",
+        params={"api-key": HELIUS_API_KEY, "type": "SWAP", "limit": 40},
+        retries=1,
+    )
+    buys: dict = {}
+    sells: dict = {}
+    if not isinstance(data, list):
+        return buys, sells
+    cutoff = time.time() - WHALE_LOOKBACK_MIN * 60
+    for tx in data:
+        if not isinstance(tx, dict):
+            continue
+        ts = to_float(tx.get("timestamp"))
+        if ts < cutoff:
+            continue
+        for tr in tx.get("tokenTransfers") or []:
+            if not isinstance(tr, dict):
+                continue
+            mint = tr.get("mint")
+            if not mint or mint in EXCLUDED_MINTS:
+                continue
+            if tr.get("toUserAccount") == wallet:
+                buys[mint] = max(buys.get(mint, 0.0), ts)
+            elif tr.get("fromUserAccount") == wallet:
+                sells[mint] = max(sells.get(mint, 0.0), ts)
+    return buys, sells
+
+
+async def whale_activity(client: httpx.AsyncClient) -> dict:
+    """{mint: {"wallets": set, "ts": آخر شراء}} للعملات التي اشترتها محافظك ولم تبعها بعد."""
+    sem = asyncio.Semaphore(3)
+
+    async def one(w: str):
+        async with sem:
+            return w, await fetch_wallet_trades(client, w)
+
+    results = await asyncio.gather(*(one(w) for w in WHALE_WALLETS[:30]), return_exceptions=True)
+    out: dict = {}
+    for r in results:
+        if isinstance(r, Exception):
+            continue
+        w, (buys, sells) = r
+        for mint, ts in buys.items():
+            if sells.get(mint, 0.0) > ts:
+                continue  # باعتها بعد الشراء
+            info = out.setdefault(mint, {"wallets": set(), "ts": 0.0})
+            info["wallets"].add(w)
+            info["ts"] = max(info["ts"], ts)
+    return out
 
 
 # ───────────────────────────── المسح الكامل ─────────────────────────────
@@ -770,6 +847,7 @@ class ScanResult:
     discovered: int = 0
     after_prefilter: int = 0
     after_security: int = 0
+    whale_mints: int = 0
     finished_at: float = 0.0
 
 
@@ -781,7 +859,13 @@ def grade_of(c: Candidate) -> str:
     return "🟠 ضعيفة (مضاربة)"
 
 
-async def run_scan(client: httpx.AsyncClient, progress=None, budget: float = SCAN_BUDGET_SEC) -> ScanResult:
+async def run_scan(
+    client: httpx.AsyncClient,
+    progress=None,
+    budget: float = SCAN_BUDGET_SEC,
+    max_mcap: Optional[float] = None,
+    whale_only: bool = False,
+) -> ScanResult:
     t0 = time.time()
 
     def left() -> float:
@@ -796,9 +880,24 @@ async def run_scan(client: httpx.AsyncClient, progress=None, budget: float = SCA
 
     res = ScanResult()
 
+    # 0) الحيتان (إن كانت مفعّلة)
+    whale_map: dict = {}
+    if whale_enabled():
+        await say("🐋 تتبع محافظ الحيتان...")
+        try:
+            whale_map = await asyncio.wait_for(whale_activity(client), timeout=min(25.0, left()))
+        except asyncio.TimeoutError:
+            whale_map = {}
+    res.whale_mints = len(whale_map)
+
     # 1) اكتشاف
     await say("🔎 (1/4) جمع العملات من المصادر...")
-    addrs, res.sources = await discover_token_addresses(client, timeout=min(35.0, left()))
+    if whale_only:
+        addrs, res.sources = list(whale_map), {"محافظ الحيتان": len(whale_map)}
+    else:
+        addrs, res.sources = await discover_token_addresses(
+            client, timeout=min(35.0, left()), extra=list(whale_map)
+        )
 
     # 2) بيانات الأزواج
     await say(f"📊 (2/4) جلب بيانات {len(addrs)} عملة...")
@@ -814,7 +913,11 @@ async def run_scan(client: httpx.AsyncClient, progress=None, budget: float = SCA
         if m is None:
             res.stats["بيانات ناقصة"] += 1
             continue
-        reason = pre_filter(m)
+        info = whale_map.get(m["mint"])
+        if info:
+            m["whale_count"] = len(info["wallets"])
+            m["whale_age"] = (time.time() - info["ts"]) / 60
+        reason = pre_filter(m, max_mcap)
         if reason:
             res.stats[reason] += 1
         else:
@@ -893,6 +996,8 @@ async def run_scan(client: httpx.AsyncClient, progress=None, budget: float = SCA
             plans.append(compute_alt_plan("MOMENTUM", m, candles))
         if hold_ok(m):
             plans.append(compute_alt_plan("HOLD", m, candles))
+        if not plans and m.get("whale_count"):
+            plans.append(compute_alt_plan("MOMENTUM", m, candles))  # متابعة الحيتان
         if not plans:
             res.stats["لا تطابق أي نمط (سكالبيج/زخم/احتفاظ)"] += 1
             continue
@@ -924,6 +1029,11 @@ def format_best(c: Candidate, alts: list) -> str:
     rug_txt = f"خطورة {s.rug_norm:.0f}/100" if s.rug_norm is not None else f"raw {s.rug_raw:.0f}"
     bundle_txt = "🚨 مرصودة أنماط Bundled/Insider" if s.bundled else "✅ لا يوجد"
     b = c.breakdown
+    whale_txt = ""
+    if m.get("whale_count"):
+        age = m.get("whale_age")
+        when = f" (آخر شراء قبل {age:.0f} دقيقة)" if age is not None else ""
+        whale_txt = f"🐋 اشترتها {m['whale_count']} من محافظ الحيتان التي تتبعها{when}\n"
 
     head = (
         f"{grade} — <b>صفقة {html.escape(KIND_LABEL[p.kind])}</b>\n"
@@ -949,7 +1059,8 @@ def format_best(c: Candidate, alts: list) -> str:
         f"• السيولة: {fmt_usd(m['liq'])} | MC: {fmt_usd(m['mcap'])} | Liq/MC: {m['liq_mcap'] * 100:.1f}%\n"
         f"• 🐋 Top10: {s.top10:.1f}% | Dev: {dev_txt} | Bundles: {bundle_txt}\n\n"
         f"⚡ <b>الزخم</b>: 5m {m['chg5']:+.1f}% | 1h {m['chg1']:+.1f}% | 24h {m['chg24']:+.0f}%\n"
-        f"• فوليوم 5m ×{m['vol_pace']:.1f} | ضغط الشراء {m['buy_ratio5'] * 100:.0f}%\n\n"
+        f"• فوليوم 5m ×{m['vol_pace']:.1f} | ضغط الشراء {m['buy_ratio5'] * 100:.0f}%\n"
+        f"{whale_txt}\n"
     )
 
     if p.kind == "SCALP":
@@ -1001,7 +1112,7 @@ def format_best(c: Candidate, alts: list) -> str:
         alt_txt = "\n📋 <b>بدائل:</b>\n"
         for a in alts:
             alt_txt += (
-                f"• {KIND_SHORT[a.plan.kind]} {html.escape(a.m['name'])} (${html.escape(a.m['symbol'])})"
+                f"• {'🐋 ' if a.m.get('whale_count') else ''}{KIND_SHORT[a.plan.kind]} {html.escape(a.m['name'])} (${html.escape(a.m['symbol'])})"
                 f" — {a.score}/100 {grade_of(a)}\n<code>{a.m['mint']}</code>\n"
             )
 
@@ -1036,7 +1147,9 @@ def to_plain(text: str) -> str:
 WELCOME = (
     "🎯 <b>SolAlpha Sniper</b>\n\n"
     "مسح لحظي لعملات Solana: يعطيك أفضل صفقة متاحة مع نوعها (سكالبيج / زخم / احتفاظ).\n\n"
-    "• /best — أفضل صفقة الآن + بدائل\n"
+    "• /best — أفضل صفقة الآن + بدائل (لا تتكرر نفس العملة)\n"
+    "• /best 500k — بحد أقصى للماركت كاب (الافتراضي 1M)\n"
+    "• /whales — عملات اشترتها محافظ الحيتان التي تتبعها\n"
     "• /diag — تشخيص مصادر البيانات\n"
     "• /help — شرح الأنواع والفلاتر\n\n"
     "⚠️ أداة تحليل وليست نصيحة مالية."
@@ -1062,7 +1175,8 @@ async def post_init(application: Application) -> None:
     )
     application.bot_data["scan_lock"] = asyncio.Lock()
     application.bot_data["cooldowns"] = {}
-    application.bot_data["last_scan"] = None
+    application.bot_data["scan_cache"] = {}
+    application.bot_data["seen"] = {}
 
 
 async def post_shutdown(application: Application) -> None:
@@ -1107,9 +1221,44 @@ async def safe_edit(status_msg, original_msg, text: str) -> None:
         log.exception("Reply failed")
 
 
-async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+def parse_cap(arg: str) -> Optional[float]:
+    a = arg.strip().lower().replace(",", "").replace("$", "")
+    mult = 1.0
+    if a.endswith("k"):
+        mult, a = 1e3, a[:-1]
+    elif a.endswith("m"):
+        mult, a = 1e6, a[:-1]
+    try:
+        v = float(a) * mult
+    except ValueError:
+        return None
+    return v if v > 0 else None
+
+
+WHALE_SETUP = (
+    "🐋 <b>تتبع الحيتان غير مفعّل</b>\n\n"
+    "يحتاج شيئين في متغيرات البيئة على Render:\n"
+    "1) <code>HELIUS_API_KEY</code> — مفتاح مجاني من helius.dev\n"
+    "2) <code>WHALE_WALLETS</code> — عناوين محافظ رابحة تفصل بينها فاصلة. "
+    "اختَر محافظ لها سجل واضح من منصات مثل GMGN أو Kolscan أو Cielo.\n\n"
+    "بعدها /whales يعرض العملات التي اشترتها هذه المحافظ مؤخراً ولم تبعها بعد، "
+    "مع فحص الأمان والخطة. وفي /best تحصل هذه العملات على نقاط إضافية."
+)
+
+
+async def scan_and_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, whale_only: bool) -> None:
     msg = update.effective_message
     bd = context.application.bot_data
+
+    cap: Optional[float] = None
+    if context.args:
+        cap = parse_cap(context.args[0])
+        if cap is None:
+            await msg.reply_text("صيغة غير صحيحة. مثال: /best 500k أو /best 2m")
+            return
+    if whale_only and not whale_enabled():
+        await msg.reply_text(WHALE_SETUP, parse_mode=ParseMode.HTML)
+        return
 
     wait = _cooldown_wait(bd, update.effective_user.id)
     if wait:
@@ -1122,29 +1271,50 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await status_msg.edit_text(text)
 
     try:
-        cached = bd.get("last_scan")
+        key = (cap, whale_only)
+        cached = bd["scan_cache"].get(key)
         if cached and time.time() - cached.finished_at < SCAN_CACHE_SEC:
             res = cached
         else:
             async with bd["scan_lock"]:
                 res = await asyncio.wait_for(
-                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC), timeout=SCAN_BUDGET_SEC + 30
+                    run_scan(bd["http"], progress, SCAN_BUDGET_SEC, cap, whale_only),
+                    timeout=SCAN_BUDGET_SEC + 40,
                 )
-                bd["last_scan"] = res if res.discovered > 0 else None
+                if res.discovered > 0:
+                    bd["scan_cache"][key] = res
+
+        now = time.time()
+        seen: dict = bd["seen"].setdefault(update.effective_chat.id, {})
+        for k in [k for k, t in seen.items() if now - t > SEEN_TTL_SEC]:
+            del seen[k]
 
         if res.discovered == 0:
-            text = "⚠️ تعذر جلب بيانات السوق (المصادر لم ترجع شيئاً — غالباً حدّ طلبات). جرّب بعد دقيقة، أو /diag."
+            text = (
+                "🐋 لا توجد مشتريات حديثة من محافظك المتتبَّعة."
+                if whale_only and whale_enabled() and res.whale_mints == 0
+                else "⚠️ تعذر جلب بيانات السوق (المصادر لم ترجع شيئاً — غالباً حدّ طلبات). جرّب بعد دقيقة، أو /diag."
+            )
         elif res.ranked:
-            best = res.ranked[0]
-            alts, seen = [], {best.m["mint"]}
-            for c in res.ranked[1:]:
-                if c.m["mint"] in seen:
+            fresh = [c for c in res.ranked if c.m["mint"] not in seen]
+            pool = fresh or res.ranked
+            best = pool[0]
+            alts, used = [], {best.m["mint"]}
+            for c in pool[1:]:
+                if c.m["mint"] in used:
                     continue
-                seen.add(c.m["mint"])
+                used.add(c.m["mint"])
                 alts.append(c)
                 if len(alts) == 2:
                     break
-            text = format_best(best, alts)
+            note = ""
+            if not fresh:
+                note = (
+                    "🔁 كل الصفقات المتاحة الآن عُرضت عليك سابقاً — هذه الأعلى تقييماً. "
+                    "جرّب /best 3m لتوسيع النطاق أو انتظر قليلاً.\n\n"
+                )
+            text = note + format_best(best, alts)
+            seen[best.m["mint"]] = now
         else:
             text = format_no_result(res)
     except asyncio.TimeoutError:
@@ -1154,6 +1324,14 @@ async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text = "❌ حدث خطأ أثناء المسح. حاول مجدداً بعد قليل."
 
     await safe_edit(status_msg, msg, text)
+
+
+async def best_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan_and_reply(update, context, False)
+
+
+async def whales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await scan_and_reply(update, context, True)
 
 
 async def diag_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1250,6 +1428,7 @@ async def run_all() -> None:
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("best", best_cmd))
     app.add_handler(CommandHandler("diag", diag_cmd))
+    app.add_handler(CommandHandler("whales", whales_cmd))
     app.add_error_handler(on_error)
 
     runner = await start_web_server()
